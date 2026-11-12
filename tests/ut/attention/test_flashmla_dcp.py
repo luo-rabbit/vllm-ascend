@@ -657,3 +657,36 @@ def test_causal_target_and_noncausal_draft_do_not_share_schedules(runtime):
     assert target.schedule.data_ptr() != draft.schedule.data_ptr()
     assert target.current is not None and draft.current is None
     assert target.cache_lens[0] == 1 and draft.cache_lens[0] == 2
+
+
+def test_draft_rope_provider_isolated_from_nope_target(runtime, monkeypatch):
+    base = runtime.builder(size=1, use_rope=True)
+    impl = SimpleNamespace(
+        num_heads=8,
+        scale=0.125,
+        dtype=torch.float16,
+        use_mla_rope=True,
+        vllm_config=SimpleNamespace(speculative_config=None),
+    )
+    table = torch.arange(16 * 64, dtype=torch.float16).reshape(16, 64)
+
+    def draft_rope(positions):
+        cos, sin = table[positions].chunk(2, dim=-1)
+        return tuple(x.repeat(1, 2)[:, None, None] for x in (cos, sin))
+
+    monkeypatch.setitem(
+        runtime.api.FlashMLAMetadataBuilder.build.__globals__,
+        "get_cos_and_sin_mla",
+        lambda positions: (_ for _ in ()).throw(AssertionError("Target NoPE table used")),
+    )
+    builder = runtime.api.FlashMLAMetadataBuilder(impl, torch.device("cpu"), 8, base.attn_mask, rope_getter=draft_rope)
+    inputs = common([9, 12], [1, 1], tokens=4, causal=False)
+    flash = builder.build(inputs, 2, 2, False, retain_for_graph=True)
+    expected = draft_rope(flash.positions)
+    torch.testing.assert_close(flash.cos, expected[0])
+    torch.testing.assert_close(flash.sin, expected[1])
+    pointer = flash.cos.data_ptr()
+    inputs.positions += 1
+    replay = builder.build(inputs, 2, 2, False)
+    assert replay.cos.data_ptr() == pointer
+    torch.testing.assert_close(replay.cos, draft_rope(replay.positions)[0])

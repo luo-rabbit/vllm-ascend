@@ -828,7 +828,7 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = batch_req_state.req_ids
 
-        self._update_seq_lens_cpu(scheduler_output, req_ids)
+        # self._update_seq_lens_cpu(scheduler_output, req_ids)
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np

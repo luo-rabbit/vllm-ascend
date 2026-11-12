@@ -393,6 +393,13 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             attention_layer_names.append(layer_name)
             continue
 
+    if mamba_specs and any(getattr(spec, "model_version", None) == "glm5_next" for spec in kv_cache_spec.values()):
+        # GLM's planner aligns its main/KDA and indexer/tail pools separately.
+        # External draft MLA pages have their own backing and must not enlarge
+        # either target pool through the generic hybrid common-page alignment.
+        kv_cache_spec.update(mamba_specs)
+        return kv_cache_spec
+
     if mamba_specs:
         if any(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in kv_cache_spec.values()):
             # K3.1 recurrent padding is settled by NPUPlatform before the

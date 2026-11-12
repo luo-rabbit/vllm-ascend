@@ -343,6 +343,11 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         self.cos_cache = None
         self.sin_cache = None
 
+        # External DSpark may use RoPE while its GLM target uses NoPE. The
+        # process-global MLA tables then belong to a different model geometry.
+        impl = static_forward_context[layer_names[0]].impl if layer_names else None
+        self._init_dspark_rope(impl, self.speculative_config, scheduler_config.max_num_batched_tokens, device)
+
         self.chunk_seq_lens: torch.Tensor = None
         self.cu_seq_lens_cpu: torch.Tensor = None
         self.num_chunks: torch.Tensor = None
@@ -372,8 +377,44 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         if True in flashmla_choices:
             impl = static_forward_context[layer_names[0]].impl
             self.flashmla_state = FlashMLAMetadataBuilder(
-                impl, device, scheduler_config.max_num_seqs, self.attn_mask_builder.get_splitfuse_attn_mask()
+                impl,
+                device,
+                scheduler_config.max_num_seqs,
+                self.attn_mask_builder.get_splitfuse_attn_mask(),
+                rope_getter=self._get_cos_and_sin_mla,
             )
+
+    def _init_dspark_rope(self, impl, speculative_config, capacity, device):
+        self._draft_rope_table = None
+        # MRV2 DSpark deliberately retains target model_config in the builder.
+        # The bound attention layer, not that config, owns the draft geometry.
+        if impl is None or speculative_config is None or speculative_config.method != "dspark":
+            return
+        if not impl.qk_rope_head_dim:
+            return
+        self.rope_dim = impl.qk_rope_head_dim
+        self.nope_zero_rope_cache = None
+        self._draft_rope_table = impl.rotary_emb.cos_sin_cache
+        shape = (capacity, 1, 1, self.rope_dim)
+        self._draft_rope_cos = torch.empty(shape, dtype=self._draft_rope_table.dtype, device=device)
+        self._draft_rope_sin = torch.empty_like(self._draft_rope_cos)
+        logger.info("DSpark MLA metadata uses layer-owned RoPE tables (dim=%d)", self.rope_dim)
+
+    def _get_cos_and_sin_mla(self, positions, use_cache=False):
+        table = getattr(self, "_draft_rope_table", None)
+        if table is None:
+            return get_cos_and_sin_mla(positions, use_cache=use_cache)
+        cos, sin = table[positions].chunk(2, dim=-1)
+        cos = cos.repeat(1, 2).unsqueeze(1).unsqueeze(2)
+        sin = sin.repeat(1, 2).unsqueeze(1).unsqueeze(2)
+        if not use_cache:
+            return cos, sin
+        num_tokens = positions.shape[0]
+        if num_tokens > self._draft_rope_cos.shape[0]:
+            raise RuntimeError("DSpark MLA RoPE input exceeds its profiled persistent buffer")
+        self._draft_rope_cos[:num_tokens].copy_(cos)
+        self._draft_rope_sin[:num_tokens].copy_(sin)
+        return self._draft_rope_cos[:num_tokens], self._draft_rope_sin[:num_tokens]
 
     def _build_external_flashmla(self, common_prefix_len, common, *, retain_for_graph: bool = False):
         """Keep FIA prefill metadata, but build decode inputs from device state."""
@@ -610,7 +651,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             if self.is_pcp_decode_sharded:
                 # Decode rows lead the local positions, so a decode-only batch
                 # can refresh the graph-stable RoPE buffer that decode uses.
-                metadata.pcp_cos, metadata.pcp_sin = get_cos_and_sin_mla(
+                metadata.pcp_cos, metadata.pcp_sin = self._get_cos_and_sin_mla(
                     common_attn_metadata.positions.long(), use_cache=self.num_prefills == 0
                 )
         return metadata
@@ -744,7 +785,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
 
         prefill_input_positions = input_positions[tokens_start:]
         if self.use_mla_rope:
-            cos, sin = get_cos_and_sin_mla(prefill_input_positions)
+            cos, sin = self._get_cos_and_sin_mla(prefill_input_positions)
         else:
             cos = sin = None
         prefill_query_lens = self.query_lens[reqs_start:].to(torch.int32)
@@ -831,7 +872,7 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
                 )
 
         if self.use_mla_rope:
-            cos, sin = get_cos_and_sin_mla(input_positions, use_cache=True)
+            cos, sin = self._get_cos_and_sin_mla(input_positions, use_cache=True)
             cos = cos[: self.num_decode_tokens, ...]
             sin = sin[: self.num_decode_tokens, ...]
         else:
@@ -1326,7 +1367,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self._flashmla_writer_buffers is not None:
             return
         capacity = self.vllm_config.scheduler_config.max_num_batched_tokens
-        block_size = self.vllm_config.cache_config.block_size
+        # Dense temporary pages are scattered into history after PROLOG.
+        # Hybrid manager pages can exceed the operator's 1024-token limit.
+        block_size = 128
         shape = (cdiv(capacity, block_size), block_size, self.num_kv_heads)
         self._flashmla_writer_buffers = (
             torch.empty((*shape, self.kv_lora_rank), dtype=self.dtype, device=self.W_UV.device),

@@ -254,11 +254,21 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
         self.use_recoverssm = use_glm_recoverssm(vllm_config)
         saved_quant_config = vllm_config.quant_config
+        # Native HF FP8 checkpoints omit KDA projection scales, but ModelSlim
+        # KDA8 checkpoints explicitly quantize these projections. Resolve this
+        # layer's checkpoint namespace rather than scanning unrelated layers.
+        quant_description = getattr(saved_quant_config, "quant_description", {})
+        projection_prefix = f"{prefix}.q_proj"
+        prefix_mapper = getattr(saved_quant_config, "quant_prefix_mapper", None)
+        if prefix_mapper is not None:
+            projection_prefix = prefix_mapper(vllm_config.model_config.hf_config.model_type, projection_prefix)
+        quant_type = quant_description.get(f"{projection_prefix}.weight")
+        kda_quantized = isinstance(quant_type, str) and quant_type != "FLOAT"
         try:
-            vllm_config.quant_config = None
+            if not kda_quantized:
+                vllm_config.quant_config = None
             super().__init__(config, vllm_config, prefix)
         finally:
             vllm_config.quant_config = saved_quant_config

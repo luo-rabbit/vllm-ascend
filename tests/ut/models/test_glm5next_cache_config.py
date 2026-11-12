@@ -353,3 +353,105 @@ def test_worker_preserves_glm5_next_physical_pool_budget(monkeypatch, use_sparse
     plan = get_glm5_next_kv_cache_config(config, groups, budget)
     assert plan.num_blocks * get_glm5_next_pool_bytes_per_block(groups) == required
     assert sum(tensor.size for tensor in plan.kv_cache_tensors) == required
+
+
+@pytest.mark.parametrize("draft_block_size", [128, 512])
+def test_dspark_mla_groups_have_independent_pages_and_complete_budget(draft_block_size):
+    config = make_config()
+    native_groups = get_glm5_next_kv_cache_groups(config, make_specs())
+    native_bytes = get_glm5_next_pool_bytes_per_block(native_groups)
+    specs = make_specs()
+    draft_names = [f"draft.model.layers.{78 + i}.self_attn.attn" for i in range(5)]
+    for name in draft_names:
+        specs[name] = MLAAttentionSpec(block_size=draft_block_size, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    draft_group = next(group for group in groups if draft_names[0] in group.layer_names)
+    assert draft_group.layer_names == draft_names
+    assert draft_group.kv_cache_spec.block_size == draft_block_size
+    expected_bytes = native_bytes + 5 * draft_block_size * 576 * 2
+    assert get_glm5_next_pool_bytes_per_block(groups) == expected_bytes
+    budget = expected_bytes * 17 + expected_bytes - 1
+    plan = get_glm5_next_kv_cache_config(config, groups, budget)
+    assert plan.num_blocks == 17
+    assert sum(tensor.size for tensor in plan.kv_cache_tensors) == 17 * expected_bytes <= budget
+    placements = {name: tensor for tensor in plan.kv_cache_tensors for name in get_kv_cache_tensor_layers(tensor)}
+    assert set(placements) == set(specs)
+    for name in draft_names:
+        tensor = placements[name]
+        assert get_kv_cache_tensor_layers(tensor) == [name]
+        assert tensor.size == 17 * draft_block_size * 576 * 2
+        assert tensor.block_stride == draft_block_size * 576 * 2
+        assert specs[name].page_size_bytes == draft_block_size * 576 * 2
+    required_blocks = sum(
+        (group.kv_cache_spec.max_memory_usage_bytes(config) + group.kv_cache_spec.page_size_bytes - 1)
+        // group.kv_cache_spec.page_size_bytes
+        for group in groups
+    )
+    assert get_glm5_next_max_memory_usage(config, groups) == required_blocks * expected_bytes
+
+
+def test_dspark_different_draft_cache_specs_are_not_merged_or_dropped():
+    config = make_config()
+    specs = make_specs()
+    names = ["draft.layers.78.attn", "draft.layers.79.attn"]
+    for name, block_size in zip(names, (128, 256)):
+        specs[name] = MLAAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=576, dtype=torch.bfloat16)
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    draft_groups = [group for group in groups if set(group.layer_names) & set(names)]
+    assert len(draft_groups) == 2
+    plan = get_glm5_next_kv_cache_config(config, groups, get_glm5_next_pool_bytes_per_block(groups))
+    placements = {name: tensor for tensor in plan.kv_cache_tensors for name in get_kv_cache_tensor_layers(tensor)}
+    assert placements[names[0]].size == 128 * 576 * 2
+    assert placements[names[1]].size == 256 * 576 * 2
+
+
+def test_dspark_pipeline_projection_does_not_allocate_absent_draft_layers():
+    config = make_config()
+    specs = make_specs()
+    specs["draft.layers.78.attn"] = MLAAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16
+    )
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    projected = [
+        KVCacheGroupSpec([] if "draft.layers.78.attn" in group.layer_names else group.layer_names, group.kv_cache_spec)
+        for group in groups
+    ]
+    native_bytes = get_glm5_next_pool_bytes_per_block(get_glm5_next_kv_cache_groups(config, make_specs()))
+    assert get_glm5_next_pool_bytes_per_block(projected) == native_bytes
+    plan = get_glm5_next_kv_cache_config(config, projected, 10 * native_bytes)
+    assert plan.num_blocks == 10
+    assert all("draft.layers.78.attn" not in get_kv_cache_tensor_layers(t) for t in plan.kv_cache_tensors)
+
+
+@pytest.mark.parametrize("kv_heads", [32, 64])
+def test_dspark_swa_preserves_window_and_independent_physical_pages(kv_heads):
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    config = make_config()
+    config.model_config.max_model_len = 262132
+    specs = make_specs()
+    names = [f"draft.layers.{78 + i}.attn" for i in range(3)]
+    for name in names:
+        specs[name] = SlidingWindowSpec(
+            block_size=128,
+            num_kv_heads=kv_heads,
+            head_size=64,
+            dtype=torch.bfloat16,
+            sliding_window=2048,
+        )
+    groups = get_glm5_next_kv_cache_groups(config, specs)
+    draft = next(g for g in groups if names[0] in g.layer_names)
+    assert draft.layer_names == names
+    assert isinstance(draft.kv_cache_spec, SlidingWindowSpec)
+    assert draft.kv_cache_spec.sliding_window == 2048
+    required = draft.kv_cache_spec.max_memory_usage_bytes(config)
+    config.model_config.max_model_len *= 2
+    assert draft.kv_cache_spec.max_memory_usage_bytes(config) == required
+    block_bytes = get_glm5_next_pool_bytes_per_block(groups)
+    plan = get_glm5_next_kv_cache_config(config, groups, 19 * block_bytes)
+    assert plan.num_blocks == 19
+    assert sum(t.size for t in plan.kv_cache_tensors) == 19 * block_bytes
+    placements = {n: t for t in plan.kv_cache_tensors for n in get_kv_cache_tensor_layers(t)}
+    for name in names:
+        assert get_kv_cache_tensor_layers(placements[name]) == [name]
+        assert placements[name].block_stride == specs[name].page_size_bytes

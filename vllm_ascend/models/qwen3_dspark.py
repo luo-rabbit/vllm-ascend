@@ -78,6 +78,10 @@ class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         config = self.config
+        # Dummy loading bypasses load_weights, which normally marks draft-owned vocab weights.
+        if vllm_config.load_config.load_format == "dummy":
+            self.has_own_embed_tokens = True
+            self.has_own_lm_head = True
         self.enable_confidence_head = bool(getattr(config, "enable_confidence_head", False))
 
     def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:

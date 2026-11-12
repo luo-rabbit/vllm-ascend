@@ -369,3 +369,33 @@ def test_flashmla_writer_workspace_preserves_addresses_and_rejects_overflow():
     assert writer[0].data_ptr() == buffers[0].data_ptr()
     with pytest.raises(RuntimeError, match="scheduled token rows"):
         impl._prolog_v3_writer_workspace(161, views, torch.arange(161))
+
+
+@pytest.mark.parametrize("manager_block_size", [128, 8960])
+def test_writer_workspace_pages_are_independent_of_manager(manager_block_size):
+    impl = SimpleNamespace(
+        _flashmla_writer_buffers=None,
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=513),
+            cache_config=SimpleNamespace(block_size=manager_block_size),
+        ),
+        num_kv_heads=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        dtype=torch.bfloat16,
+        W_UV=torch.empty(0),
+    )
+    prepare = load(
+        MLA,
+        "_prepare_flashmla_writer_buffers",
+        {"torch": torch, "cdiv": lambda x, y: (x + y - 1) // y},
+        "AscendMLAImpl",
+    )
+    prepare(impl)
+    nope, rope, slots = impl._flashmla_writer_buffers
+    assert nope.shape == (5, 128, 1, 512)
+    assert rope.shape == (5, 128, 1, 64)
+    assert slots.numel() == 513
+    before = tuple(t.data_ptr() for t in impl._flashmla_writer_buffers)
+    prepare(impl)
+    assert tuple(t.data_ptr() for t in impl._flashmla_writer_buffers) == before

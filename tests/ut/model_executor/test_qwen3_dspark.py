@@ -118,3 +118,35 @@ def test_quarot_loads_missing_target_vocab_shards(tmp_path, model_cls) -> None:
         torch.testing.assert_close(layer.weight, expected)
     assert model.has_own_embed_tokens
     assert model.has_own_lm_head
+
+
+@pytest.mark.parametrize("load_format", ["dummy", "auto"])
+def test_dummy_draft_keeps_vocab_weights_when_target_hidden_size_differs(monkeypatch, load_format):
+    """Dummy initialization bypasses load_weights, so it must still prevent target aliasing."""
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
+    def init_parent(self, *, vllm_config, prefix):
+        nn.Module.__init__(self)
+        self.config = SimpleNamespace(enable_confidence_head=False)
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(4, 2)
+        self.lm_head = nn.Linear(2, 4, bias=False)
+
+    monkeypatch.setattr(qwen3_dspark.Qwen3DSparkForCausalLM, "__init__", init_parent)
+    monkeypatch.setattr(eagle_utils, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    config = SimpleNamespace(load_config=SimpleNamespace(load_format=load_format))
+    draft = qwen3_dspark.AscendQwen3DSparkForCausalLM(vllm_config=config)
+    original_embed, original_head = draft.model.embed_tokens, draft.lm_head
+    target = nn.Module()
+    target.embed_tokens = nn.Embedding(4, 3)
+    target_head = nn.Linear(3, 4, bias=False)
+    eagle_utils.maybe_share_target_embed(draft, draft.model, target)
+    if eagle_utils._should_share(draft, "has_own_lm_head", draft.lm_head, target_head):
+        draft.lm_head = target_head
+    if load_format == "dummy":
+        assert draft.model.embed_tokens is original_embed
+        assert draft.lm_head is original_head
+        assert draft.lm_head(draft.model.embed_tokens(torch.tensor([1]))).shape == (1, 4)
+    else:
+        assert draft.model.embed_tokens is target.embed_tokens
+        assert draft.lm_head is target_head

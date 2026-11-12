@@ -305,7 +305,15 @@ class FlashMLADecode:
 
 
 class FlashMLAMetadataBuilder:
-    def __init__(self, impl, device: torch.device, max_num_reqs: int, attn_mask: torch.Tensor):
+    def __init__(
+        self,
+        impl,
+        device: torch.device,
+        max_num_reqs: int,
+        attn_mask: torch.Tensor,
+        *,
+        rope_getter: Callable | None = None,
+    ):
         self.dcp_size = getattr(impl, "dcp_size", 1)
         self.dcp_rank = getattr(impl, "dcp_rank", 0)
         # Materialize once: an integer rank would trigger a blocking H2D copy
@@ -328,6 +336,8 @@ class FlashMLAMetadataBuilder:
         self.device = device
         self.dtype = impl.dtype
         self.use_rope = impl.use_mla_rope
+        # Draft RoPE can differ from the target process-global tables.
+        self.rope_getter = rope_getter or get_cos_and_sin_mla
         self.max_num_reqs = max_num_reqs
         self.buffers: dict[tuple, FlashMLADecode] = {}
         self.attn_mask = attn_mask
@@ -452,7 +462,7 @@ class FlashMLAMetadataBuilder:
             flash.positions[: positions.numel()].copy_(positions)
             if self.use_rope:
                 assert flash.cos is not None and flash.sin is not None
-                cos, sin = get_cos_and_sin_mla(flash.positions)
+                cos, sin = self.rope_getter(flash.positions)
                 flash.cos.copy_(cos)
                 flash.sin.copy_(sin)
             flash.schedule.copy_(flash.adapter.build_metadata(flash.cache_lens, flash.cu, flash.used_q))

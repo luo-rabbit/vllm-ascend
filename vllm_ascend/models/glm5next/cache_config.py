@@ -21,12 +21,14 @@ from vllm.v1.core.kv_cache_planning import (
     may_override_num_blocks,
 )
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -43,6 +45,7 @@ class _Glm5NextCacheLayout:
     full_group: KVCacheGroupSpec
     tail_group: KVCacheGroupSpec
     mamba_groups: tuple[KVCacheGroupSpec, ...]
+    draft_groups: tuple[KVCacheGroupSpec, ...]
     mla_names: tuple[str, ...]
     indexer_names: tuple[str, ...]
     tail_names: tuple[str, ...]
@@ -222,10 +225,14 @@ def _get_glm5_next_cache_layout(
     full_groups: list[KVCacheGroupSpec] = []
     tail_groups: list[KVCacheGroupSpec] = []
     mamba_groups: list[KVCacheGroupSpec] = []
+    draft_groups: list[KVCacheGroupSpec] = []
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
         if isinstance(group_spec, MambaSpec):
             mamba_groups.append(group)
+            continue
+        if isinstance(group_spec, (FullAttentionSpec, SlidingWindowSpec)) and not _is_glm5_next_spec(group_spec):
+            draft_groups.append(group)
             continue
         if not isinstance(group_spec, UniformTypeKVCacheSpecs):
             continue
@@ -248,7 +255,7 @@ def _get_glm5_next_cache_layout(
         raise ValueError(
             "GLM-Next requires exactly one combined main/indexer group and one compressor-tail KV cache group."
         )
-    if len(full_groups) + len(tail_groups) + len(mamba_groups) != len(kv_cache_groups):
+    if len(full_groups) + len(tail_groups) + len(mamba_groups) + len(draft_groups) != len(kv_cache_groups):
         raise ValueError("GLM-Next KV cache groups contain an unsupported cache spec.")
 
     full_group = full_groups[0]
@@ -294,6 +301,7 @@ def _get_glm5_next_cache_layout(
         full_group=full_group,
         tail_group=tail_group,
         mamba_groups=tuple(mamba_groups),
+        draft_groups=tuple(draft_groups),
         mla_names=mla_names,
         indexer_names=indexer_names,
         tail_names=tail_names,
@@ -375,15 +383,33 @@ def get_glm5_next_kv_cache_groups(
 
     _align_glm5_next_cache_specs(kv_cache_spec)
     mamba_specs = {name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)}
-    attention_specs = {name: spec for name, spec in kv_cache_spec.items() if not isinstance(spec, MambaSpec)}
+    attention_specs = {name: spec for name, spec in kv_cache_spec.items() if _is_glm5_next_spec(spec)}
     groups = _create_glm5_next_attention_groups(attention_specs)
+    # External DSpark drafts own ordinary attention caches, not compressed
+    # GLM main/indexer/tail pages. Preserve their native block size and dtype.
+    draft_groups: list[KVCacheGroupSpec] = []
+    for name, spec in kv_cache_spec.items():
+        if name in attention_specs or name in mamba_specs:
+            continue
+        if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+            raise ValueError("GLM-Next only supports full or sliding-attention caches for external drafts.")
+        for group in draft_groups:
+            if group.kv_cache_spec == spec:
+                group.layer_names.append(name)
+                break
+        else:
+            draft_groups.append(KVCacheGroupSpec([name], spec))
     if not mamba_specs:
         # The standalone MTP runner has the same attention/tail pairing but
         # no recurrent groups.
-        return groups
+        return groups + draft_groups
 
-    grouped_names = _group_glm5_next_mamba_layer_names(kv_cache_spec, mamba_specs)
+    native_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if name in attention_specs or name in mamba_specs
+    }
+    grouped_names = _group_glm5_next_mamba_layer_names(native_specs, mamba_specs)
     groups.extend(_create_mamba_groups(mamba_specs, grouped_names))
+    groups.extend(draft_groups)
     return groups
 
 
@@ -393,7 +419,10 @@ def get_glm5_next_pool_bytes_per_block(groups: list[KVCacheGroupSpec]) -> int:
     layout = _get_glm5_next_cache_layout(groups)
     if layout is None:
         raise ValueError("Expected GLM-Next cache groups.")
-    return layout.main_slot_count * layout.main_page_size + layout.small_slot_count * layout.small_page_size
+    draft_bytes = sum(len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in layout.draft_groups)
+    return (
+        layout.main_slot_count * layout.main_page_size + layout.small_slot_count * layout.small_page_size + draft_bytes
+    )
 
 
 def get_glm5_next_kv_cache_config(
@@ -447,6 +476,13 @@ def get_glm5_next_kv_cache_config(
                 layout.small_page_size,
             )
         )
+
+    # Draft scheduler groups draw independent block IDs from the global pool.
+    # Give every draft layer its own backing tensor; none aliases target KV.
+    for group in layout.draft_groups:
+        page_size = group.kv_cache_spec.page_size_bytes
+        for name in group.layer_names:
+            tensors.append(make_tensor(page_size * num_blocks, [name], page_size))
 
     return KVCacheConfig(
         num_blocks=num_blocks,

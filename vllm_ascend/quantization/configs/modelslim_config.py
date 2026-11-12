@@ -170,18 +170,20 @@ UPDATED_PACKED_MODULES_MAPPING: dict[str, dict[str, list[str]]] = {
     # GLM-5.3-Flash (glm5_next): KDA layers ship a fused q/k/v/b/f_a/g_a
     # projection; sparse-MLA layers keep the DeepSeek-style q_a/kv_a pair.
     # Native HF FP8 checkpoints leave the KDA projections in bf16 via
-    # modules_to_not_convert; this mapping is for ModelSlim w8a8 later.
+    # modules_to_not_convert; ModelSlim KDA8 uses the packed mappings below.
     "glm5_next": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
+        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
     },
     "glm5_next_mtp": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
         "fused_qkvbfg_a_proj": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
+        "in_proj_qkvbfg_a": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj"],
     },
     "deepseek_mtp": {
         "gate_up_proj": ["gate_proj", "up_proj"],
