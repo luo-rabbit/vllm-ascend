@@ -1,0 +1,68 @@
+{
+  "created_at": "2026-11-18T15:52:02.481003+08:00",
+  "purpose": "Eight-node EP64 TP1 DP64 SWA DSpark7 dummy experiment bundle; not hardware tested",
+  "vllm": {
+    "repository": "https://github.com/vllm-project/vllm",
+    "head": "4ba787ec9959e566d3b587a796dff07673324da5"
+  },
+  "vllm_ascend": {
+    "repository": "https://github.com/luo-rabbit/vllm-ascend",
+    "branch": "ljt/glm53-dspark-kda8",
+    "head_before_bundle": "80eef2fc3700cdff6c9f12a11f9288101cd556e8"
+  },
+  "sources_sha256": {
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/config.json": "f2b900440f7845240c096f05d6cbaa3ac075ba4ef46481d33c538d656bcf6c2f",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/tokenizer.json": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/tokenizer_config.json": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/processor_config.json": "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/chat_template.jinja": "34d5ee66b12fa6446cdae131c352b8f68cd85369e0e6fda115583805fada3891",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/generation_config.json": "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/quant_model_description.json": "d8aab86df6395a0ed9b218ac899dd0a017dba6da21a4f1d7b02c8adf16c1d147",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8/EP64_EXPANSION.json": "710f4093bf7e78ca68b51586f2f55ffa7583d55e5660a6cef6875e7ee87115dd",
+    "/mnt/share/l00887471/10t/glm5.3-flash/configs/draft-glm53-dspark-swa-dummy-spec7/config.json": "90d086be34488a78ce9273627bd57ccf7f8b10598065fa6437eaf63aa6b15fd6",
+    "/mnt/share/l00887471/aisbench_auto_tools_prefix/config.py": "6396da7123d43dcdeb79bbc52b3d07319c98bb5fb2b7c60cc8411f8c9095de96"
+  },
+  "draft_metadata_change": {
+    "field": "speculators_config.verifier.name_or_path",
+    "before": "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep16-l78-w4a4c8-kda8",
+    "after": "../glm5.3-flash-10T-ep64-l78-w4a4c8-kda8",
+    "meaning": "Reference label relative to draft directory. Launch explicitly supplies target and draft absolute paths; do not serve draft config as the main model."
+  },
+  "tokenizer_files": "Dereferenced copies, byte-identical to source files",
+  "topology": {
+    "nodes": 8,
+    "local_dp": 8,
+    "tp": 1,
+    "dp": 64,
+    "ep": 64,
+    "start_ranks": [
+      0,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56
+    ]
+  },
+  "benchmark": {
+    "input_len": 262132,
+    "output_len": 4096,
+    "data_num": 256,
+    "concurrency": 256,
+    "dp": 64,
+    "npu_num": 64
+  },
+  "operator_environment": "Image-provided CANN by default; isolated PoolKey binaries and FLA-first wrapper not bundled",
+  "load_format": {
+    "target": "dummy",
+    "draft": "dummy"
+  },
+  "source_configuration_preserved": true,
+  "hardware_service_started": false,
+  "source_worktrees_before_bundle": {
+    "vllm": "clean",
+    "vllm_ascend": "clean"
+  }
+}

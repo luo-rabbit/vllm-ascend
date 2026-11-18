@@ -1,0 +1,539 @@
+# 一、服务器环境搭建与常用命令
+
+## 1. 服务器 SSH 公钥推送
+
+用于将本机 SSH 公钥添加到服务器，后续登录服务器时避免频繁输入密码。
+
+**完整流程：**
+
+Windows CMD：
+
+```cmd
+type %USERPROFILE%\.ssh\id_ed25519.pub | ssh <user>@<server> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Windows PowerShell：
+
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh <user>@<server> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+```
+
+其中：
+
+```
+<user>    # 服务器用户名
+<server>  # 服务器 IP 或域名
+```
+
+上述命令默认本地已经存在：
+
+```
+%USERPROFILE%\.ssh\id_ed25519.pub
+```
+
+推送完成后，可以重新连接服务器确认是否还需要输入 SSH 密码：
+
+```
+ssh <user>@<server>
+```
+
+------
+
+## 2. 创建 Ascend 开发容器
+
+用于基于现有 vLLM Ascend 镜像创建开发容器，并挂载 NPU Driver、CANN 相关目录以及宿主机工作目录。
+
+**完整流程：**
+
+```bash
+# 确认服务器系统选择合适的镜像
+# 查看操作系统版本
+cat /etc/os-release
+# 查看系统和架构
+uname -m
+
+# ===== 参数 =====
+CONTAINER_NAME=<容器名称>
+IMAGE=<容器镜像ID或镜像名称>
+
+# ===== 创建容器 =====
+docker run \
+    --name "$CONTAINER_NAME" \
+    -it \
+    -d \
+    --net=host \
+    --shm-size=500g \
+    --privileged=true \
+    -w /home \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --device=/dev/devmm_svm \
+    --entrypoint=bash \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /home:/home \
+    -v /tmp:/tmp \
+    -v /data:/data \
+    -v /mnt:/mnt \
+    -v /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime \
+    -v /etc/hccn.conf:/etc/hccn.conf \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -e http_proxy="$http_proxy" \
+    -e https_proxy="$https_proxy" \
+    "$IMAGE"
+```
+
+例如：
+
+```bash
+CONTAINER_NAME=mr2-pp-combo-verify
+IMAGE=<容器镜像ID>
+```
+
+创建后确认：
+
+```bash
+docker ps -a --filter "name=$CONTAINER_NAME"
+```
+
+进入容器：
+
+```bash
+docker exec -it "$CONTAINER_NAME" bash
+```
+
+------
+
+## 3. 检查当前 vLLM 和 vLLM Ascend 版本
+
+在基线容器中先确认当前安装的 vLLM 和 vLLM Ascend 版本信息，并记录对应 Commit，后续源码环境使用相同 Commit。
+
+**完整流程：**
+
+```bash
+# 查看 vLLM 版本信息
+cat /usr/local/python3.11.10/lib/python3.11/site-packages/vllm/_version.py
+
+# 查看 vLLM Ascend 版本信息
+cat /usr/local/python3.11.10/lib/python3.11/site-packages/vllm_ascend/_version.py
+```
+
+记录其中对应的：
+
+```bash
+VLLM_COMMIT=<vllm commit>
+VLLM_ASCEND_COMMIT=<vllm-ascend commit>
+```
+
+后续源码安装时切换到对应 Commit，保证源码环境与基线环境一致。
+
+------
+
+## 4. 获取 vLLM 和 vLLM Ascend 源码
+
+可以选择直接从 GitHub Clone，也可以复用服务器上已经下载好的源码目录。
+
+**方式 A：直接 Clone，完整流程：**
+
+```bash
+# ===== 参数 =====
+BASE_DIR=<安装目录>
+VLLM_COMMIT=<vllm commit>
+VLLM_ASCEND_COMMIT=<vllm-ascend commit>
+
+# ===== 创建并进入安装目录 =====
+mkdir -p "$BASE_DIR"
+cd "$BASE_DIR"
+
+# ===== 获取 vLLM =====
+git clone https://github.com/vllm-project/vllm.git
+git -C vllm checkout "$VLLM_COMMIT"
+
+# ===== 获取 vLLM Ascend =====
+git clone https://github.com/vllm-project/vllm-ascend.git
+git -C vllm-ascend checkout "$VLLM_ASCEND_COMMIT"
+
+# ===== 验证 Commit =====
+git -C "$BASE_DIR/vllm" rev-parse HEAD
+git -C "$BASE_DIR/vllm-ascend" rev-parse HEAD
+```
+
+`git rev-parse HEAD` 会输出完整 40 位 Commit SHA，确认与记录的 Commit 一致。
+
+**方式 B：复用已有源码目录，完整流程：**
+
+```bash
+# ===== 参数 =====
+BASE_DIR=<安装目录>
+SOURCE_VLLM=<已有vllm源码目录>
+SOURCE_VLLM_ASCEND=<已有vllm-ascend源码目录>
+
+# ===== 创建并进入安装目录 =====
+mkdir -p "$BASE_DIR"
+cd "$BASE_DIR"
+
+# ===== 复制源码 =====
+cp -a "$SOURCE_VLLM" ./vllm
+cp -a "$SOURCE_VLLM_ASCEND" ./vllm-ascend
+
+# ===== 根据需要修改远端仓库 =====
+git -C "$BASE_DIR/vllm" remote set-url origin <vllm仓库地址>
+git -C "$BASE_DIR/vllm-ascend" remote set-url origin <vllm-ascend仓库地址>
+
+# ===== 查看 Remote =====
+git -C "$BASE_DIR/vllm" remote -v
+git -C "$BASE_DIR/vllm-ascend" remote -v
+
+# ===== 验证 Commit =====
+git -C "$BASE_DIR/vllm" rev-parse HEAD
+git -C "$BASE_DIR/vllm-ascend" rev-parse HEAD
+```
+
+------
+
+## 5. 创建 Python 虚拟环境
+
+在统一安装目录创建虚拟环境，并复用容器中已经存在的系统级 Python Package。
+
+**完整流程：**
+
+```bash
+# ===== 参数 =====
+BASE_DIR=<安装目录>
+
+# ===== 创建虚拟环境 =====
+cd "$BASE_DIR"
+
+/usr/local/python3.11.10/bin/python3.11 \
+    -m venv \
+    --system-site-packages \
+    .venv
+
+# ===== 激活虚拟环境 =====
+source .venv/bin/activate
+
+# ===== 确认 Python =====
+which python
+python --version
+
+# ===== 确认 Pip =====
+which pip
+pip --version
+```
+
+------
+
+## 6. 安装 vLLM
+
+安装源码版 vLLM，并避免重新安装或覆盖当前环境中已有的 Torch。
+
+**完整流程：**
+
+```bash
+# ===== 参数 =====
+BASE_DIR=<安装目录>
+
+# ===== 激活虚拟环境 =====
+cd "$BASE_DIR"
+source .venv/bin/activate
+
+# ===== 进入 vLLM =====
+cd "$BASE_DIR/vllm"
+
+# ===== 查看 build-system 依赖 =====
+sed -n '/\[build-system\]/,/^\[/p' pyproject.toml
+
+# ===== 更新 Pip =====
+python -m pip install --upgrade pip
+
+# ===== 安装 build-system 依赖，但跳过 Torch =====
+python - <<'PY' | xargs -d '\n' python -m pip install
+import tomllib
+
+with open("pyproject.toml", "rb") as f:
+    data = tomllib.load(f)
+
+for dep in data["build-system"]["requires"]:
+    if not dep.strip().lower().startswith("torch"):
+        print(dep)
+PY
+
+# ===== Editable 安装 vLLM =====
+VLLM_TARGET_DEVICE=empty \
+python -m pip install \
+    -v \
+    -e . \
+    --no-deps \
+    --no-build-isolation \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ===== 验证 =====
+python -c "import vllm; print('version:', vllm.__version__); print('path:', vllm.__file__)"
+```
+
+其中：
+
+```
+--no-deps
+```
+
+用于避免 Pip 根据项目依赖重新安装 Torch 等已有依赖。
+
+```
+--no-build-isolation
+```
+
+表示构建时直接使用当前虚拟环境中的依赖，而不是重新创建隔离的 Build Environment。
+
+------
+
+## 7. 安装 vLLM Ascend
+
+安装源码版 vLLM Ascend 前，需要先加载 CANN 环境，并清理可能残留的旧构建产物。
+
+**完整流程：**
+
+```bash
+# ===== 参数 =====
+BASE_DIR=<安装目录>
+
+# ===== 激活虚拟环境 =====
+cd "$BASE_DIR"
+source .venv/bin/activate
+
+# ===== 加载 CANN 环境 =====
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+# ===== 进入 vLLM Ascend =====
+cd "$BASE_DIR/vllm-ascend"
+
+# ===== 清理常见旧构建目录 =====
+git clean -fdX -- \
+    build \
+    csrc/build
+
+# ===== Editable 安装 =====
+python -m pip install \
+    -v \
+    -e . \
+    --no-deps \
+    --no-build-isolation \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ===== 将两个源码目录同时加入 Python 搜索路径 =====
+printf '%s\n' \
+    "$BASE_DIR/vllm" \
+    "$BASE_DIR/vllm-ascend" \
+    > "$BASE_DIR/.venv/lib/python3.11/site-packages/00-local-vllm-sources.pth"
+
+# ===== 验证 vLLM =====
+python -c "import vllm; print('version:', vllm.__version__); print('path:', vllm.__file__)"
+
+# ===== 验证 vLLM Ascend =====
+python -c "import vllm_ascend; print('path:', vllm_ascend.__file__)"
+
+# ===== 验证 Torch =====
+python -c "import torch; print('version:', torch.__version__); print('path:', torch.__file__)"
+```
+
+`.pth` 文件中同时写入：
+
+```
+<安装目录>/vllm
+<安装目录>/vllm-ascend
+```
+
+避免分别写入同一个 `.pth` 文件时，后一次执行 `>` 将前一次路径覆盖。
+
+------
+
+## 8. 完整清理 vLLM Ascend 旧构建产物
+
+当源码切换 Commit、切换分支、重新编译后出现旧 `.so` 或 Custom Op 残留问题时，可以执行完整清理。
+
+**完整流程：**
+
+```bash
+# ===== 进入源码目录 =====
+cd <安装目录>/vllm-ascend
+
+# ===== 1. 预览即将删除的文件 =====
+git clean -ndX -- \
+    build \
+    csrc/build \
+    csrc/build_out \
+    vllm_ascend/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so \
+    vllm_ascend/libvllm_ascend_kernels.so \
+    vllm_ascend/lib \
+    vllm_ascend/_cann_ops_custom/vendors
+
+# ===== 2. 确认输出范围正确后正式清理 =====
+git clean -fdX -- \
+    build \
+    csrc/build \
+    csrc/build_out \
+    vllm_ascend/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so \
+    vllm_ascend/libvllm_ascend_kernels.so \
+    vllm_ascend/lib \
+    vllm_ascend/_cann_ops_custom/vendors
+```
+
+先执行：
+
+```bash
+git clean -ndX
+```
+
+只预览，不真正删除。
+
+确认只包含预期的构建目录、`.so`、`lib/` 和 Custom Op 安装目录后，再执行：
+
+```bash
+git clean -fdX
+```
+
+进行实际清理。
+
+------
+
+## 9. AISBench 常用测试命令
+
+用于性能测试、Prefix Cache、Prefill、精度测试以及 Profiling。
+
+**完整流程：**
+
+```bash
+python3 -c "import ais_bench; print('version:', getattr(ais_bench,'__version__','?')); print('path:', ais_bench.__file__)"
+
+# ===== 进入 AISBench 测试目录 =====
+cd <aisbench测试目录>
+
+# ===== 根据测试目标选择下面对应命令 =====
+```
+
+开始采集 Profiling：
+
+```bash
+curl -X POST "http://0.0.0.0:9090/start_profile"
+```
+
+停止采集 Profiling：
+
+```bash
+curl -X POST "http://0.0.0.0:9090/stop_profile"
+```
+
+Prefix Cache 测试：
+
+```bash
+python3 aisbench_test.py \
+    --input_len 32768 \
+    --output_len 500 \
+    --data_num 64 \
+    --concurrency 32 \
+    --request_rate 0 \
+    --dataset_type prefix_cache \
+    --repeat_rate 0.9 \
+    --prefix_test
+```
+
+Prefill 测试：
+
+```bash
+python3 aisbench_test.py \
+    --input_len 262144 \
+    --output_len 1 \
+    --data_num 1 \
+    --concurrency 1
+```
+
+精度测试：
+
+```bash
+python3 aisbench_test.py \
+    --dataset <aisbench目录>/dataset/gsm8k/test.jsonl \
+    --output_len 6000 \
+    --concurrency 16 \
+    --request_rate 0 \
+    --test_type stream \
+    --test_accuracy \
+    --spec_decode_metrics
+```
+
+------
+
+## 10. 安装 Codex
+
+export DISABLE_AUTOUPDATER=1
+
+安装 OpenAI Codex CLI。
+
+**完整流程：**
+
+```bash
+# 安装 Codex
+npm install -g @openai/codex
+
+# 查看安装结果
+codex --version
+```
+
+修改codex权限，编辑 `~/.codex/config.toml`： 
+
+```bash
+# "danger-full-access"是完全放开
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+# user：自己审批
+# auto_review：自动审查符合条件的权限申请
+approvals_reviewer = "user"
+```
+
+------
+
+## 11. 手动查看 Spec Decode 采信数据
+
+用于直接从 vLLM Metrics 中获取 Draft Token 和 Accepted Token 累计值。
+
+**完整流程：**
+
+```bash
+curl --noproxy '*' \
+    -fsS \
+    http://127.0.0.1:9090/metrics \
+    | grep -E '^vllm:spec_decode_num_(draft_tokens|accepted_tokens)_total'
+```
+
+主要关注：
+
+```
+vllm:spec_decode_num_draft_tokens_total
+vllm:spec_decode_num_accepted_tokens_total
+```
+
+如果需要手动计算采信率：
+
+```
+采信率 = accepted_tokens / draft_tokens
+```
+
+例如获取两个指标后：
+
+```bash
+draft_tokens=<draft_tokens值>
+accepted_tokens=<accepted_tokens值>
+
+awk -v accepted="$accepted_tokens" -v draft="$draft_tokens" \
+    'BEGIN {
+        if (draft == 0) {
+            print "draft_tokens is 0"
+        } else {
+            printf "Acceptance Rate: %.4f (%.2f%%)\n", accepted / draft, accepted / draft * 100
+        }
+    }'
+```
+

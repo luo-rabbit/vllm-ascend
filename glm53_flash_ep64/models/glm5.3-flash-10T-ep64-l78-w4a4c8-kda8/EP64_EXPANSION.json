@@ -1,0 +1,47 @@
+{
+  "created_at": "2026-11-18T11:19:46.117232+08:00",
+  "source": "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep32-l78-w4a4c8-kda8",
+  "reference": "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep16-l78-w4a4c8-kda8",
+  "destination": "/mnt/share/l00887471/10t/glm5.3-flash/configs/glm5.3-flash-10T-ep64-l78-w4a4c8-kda8",
+  "rule": "EP16=112 -> EP32=224 -> EP64=448; 7 routed experts per EP rank",
+  "source_sha256": {
+    "glm5.3-flash-10T-ep16-l78-w4a4c8-kda8/config.json": "5beb42d18ae303559fdfd65bd1d4a0b791446d874896f9679a4a50c85d85a0af",
+    "glm5.3-flash-10T-ep16-l78-w4a4c8-kda8/quant_model_description.json": "eaebae53884c0b0f791bacabcba2d2bb8fc3a8e9b375af16e6bde8b1fee59b79",
+    "glm5.3-flash-10T-ep32-l78-w4a4c8-kda8/config.json": "4a3328bf5d4e34ce813279ebd6fd6d84d374244bebd5c38ccd92776842055738",
+    "glm5.3-flash-10T-ep32-l78-w4a4c8-kda8/quant_model_description.json": "f22c8396062ef62c75dd4694f46ed8b555a37bb8c78bbd919574927b73c346b5"
+  },
+  "changed_config_fields": [
+    "text_config.n_routed_experts:224->448",
+    "_comment"
+  ],
+  "preserved": {
+    "layers": 78,
+    "layer_types": {
+      "linear_attention": 59,
+      "deepseek_sparse_attention": 19
+    },
+    "topk": 16,
+    "moe_intermediate_size": 4096,
+    "quant_nonexpert_entries": 3038,
+    "all_original_quant_entries_unchanged": true,
+    "tokenizer_symlinks_unchanged": true
+  },
+  "quant_expert_layers": 76,
+  "expert_id_range": [
+    0,
+    447
+  ],
+  "quant_entries_before": 105182,
+  "quant_entries_after": 207326,
+  "added_expert_quant_entries": 102144,
+  "expert_quantization": {
+    "W4A4_MXFP4": 204288
+  },
+  "load_format": "dummy; no model weights generated",
+  "runtime_ep_size": 64,
+  "operator_environment": "not changed; model config does not select system/custom CANN",
+  "output_sha256": {
+    "config.json": "f2b900440f7845240c096f05d6cbaa3ac075ba4ef46481d33c538d656bcf6c2f",
+    "quant_model_description.json": "d8aab86df6395a0ed9b218ac899dd0a017dba6da21a4f1d7b02c8adf16c1d147"
+  }
+}
