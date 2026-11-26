@@ -161,6 +161,7 @@ class NPUModelRunner(GPUModelRunner):
         # boundary and sequence length padding during FULL graph execution.
         self.use_fia = False
         self._uses_flashmla = False
+        self._draft_prepare_ids: list[int] | None = None
         # FusedMoE can be constructed by the parent initializer and reads this
         # capacity while setting up MC2 communication.
         set_potential_max_tokens(vllm_config)
@@ -610,6 +611,18 @@ class NPUModelRunner(GPUModelRunner):
                 return super().capture_model()
             return super().capture_model(profile_only=profile_only)
 
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().update_requests(scheduler_output)
+        self._draft_prepare_ids = getattr(scheduler_output, "draft_block_ids_to_prepare", None)
+
+    def _zero_prepared_draft_pages(self) -> None:
+        prepare_ids = getattr(self, "_draft_prepare_ids", None)
+        if not prepare_ids:
+            return
+        self._draft_prepare_ids = None
+        assert self.kv_block_zeroer is not None
+        self.kv_block_zeroer.zero_block_ids(prepare_ids)
+
     # runtime_guard_step must stay INNER (below @torch.inference_mode()) so the
     # wave sync keeps running inside the inference-mode context.
     @torch.inference_mode()
@@ -672,9 +685,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 forward_failed = False
             finally:
-                finish_execution = getattr(self.model_state, "finish_execution", None)
-                if finish_execution is not None:
-                    finish_execution(failed=forward_failed)
+                try:
+                    self._zero_prepared_draft_pages()
+                finally:
+                    finish_execution = getattr(self.model_state, "finish_execution", None)
+                    if finish_execution is not None:
+                        finish_execution(failed=forward_failed)
         if not dummy_run and not is_profile:
             self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False

@@ -1561,6 +1561,35 @@ def _setup_worker_and_scheduler(
                 "vllm_ascend.core.batch_job_aware_scheduler.BatchJobAwareScheduler"
             )
 
+    if (
+        getattr(ascend_config, "dspark_prepare_next_page", False) is True
+        and not is_draft_config_context()
+    ):
+        spec = vllm_config.speculative_config
+        if (
+            spec is None
+            or spec.method != "dspark"
+            or not vllm_config.use_v2_model_runner
+            or vllm_config.model_config.hf_text_config.model_type != "glm5_next_text"
+            or vllm_config.kv_transfer_config is not None
+            or parallel_config.pipeline_parallel_size != 1
+            or parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.decode_context_parallel_size != 1
+        ):
+            raise ValueError("dspark_prepare_next_page requires GLM5 MRV2 DSpark, without PP, CP or KV transfer")
+        engine_scheduler = vllm_config.scheduler_config
+        next_page_scheduler = (
+            "vllm_ascend.core.dspark_next_page.DSparkNextPageAsyncScheduler"
+            if engine_scheduler.async_scheduling
+            else "vllm_ascend.core.dspark_next_page.DSparkNextPageScheduler"
+        )
+        if (
+            engine_scheduler.scheduler_cls not in (None, next_page_scheduler)
+            or scheduler_config.enable_balance_scheduling
+        ):
+            raise ValueError("dspark_prepare_next_page requires the default scheduler")
+        engine_scheduler.scheduler_cls = next_page_scheduler
+
     _downgrade_swa_bounded_replay(vllm_config, ascend_config)
 
 

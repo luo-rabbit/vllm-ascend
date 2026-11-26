@@ -32,6 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
+from vllm_ascend.ops.triton.zero_window import is_window_projection
 from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg, get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
@@ -79,6 +80,7 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         quant_description = getattr(vllm_config.quant_config, "quant_description", None) or {}
         self.group_size = quant_description.get("group_size", 32)
         self.dynamic_mx_quant_scale_alg = get_dynamic_mx_quant_scale_alg(vllm_config)
+        self._use_dspark_zero_windows = (vllm_config.additional_config or {}).get("dspark_prepare_next_page") is True
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn)}
@@ -148,17 +150,22 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
 
-        output = torch_npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            scale_dtype=torch_npu.float8_e8m0fnu,
-            pertoken_scale=pertoken_scale,
-            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-            bias=bias,
-            output_dtype=output_dtype,
-            group_sizes=[1, 1, self.group_size],
-        )
+        if self._use_dspark_zero_windows and is_window_projection(layer.weight_scale):
+            output = torch.ops.vllm.dspark_window_quant_matmul(
+                quantized_x, layer.weight, layer.weight_scale, pertoken_scale, bias, output_dtype, self.group_size
+            )
+        else:
+            output = torch_npu.npu_quant_matmul(
+                quantized_x,
+                layer.weight,
+                layer.weight_scale,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale=pertoken_scale,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                bias=bias,
+                output_dtype=output_dtype,
+                group_sizes=[1, 1, self.group_size],
+            )
         # reshape output for Qwen VL models
         if len(original_shape) > 2:
             output = output.view(*original_shape[:-1], -1)

@@ -46,8 +46,9 @@ from vllm_ascend.compilation.updatable_graph import (
     ContextSource,
     UpdatableGraph,
 )
+from vllm_ascend.ops.triton.zero_window import NO_BLOCK_ID, NUM_REQUESTS, TOKENS, TOKENS_PER_REQUEST, ZeroWindowPlan
 from vllm_ascend.utils import use_updatable_graph
-from vllm_ascend.worker.v2.utils import communicator_switch
+from vllm_ascend.worker.v2.utils import AscendV2KVBlockZeroer, communicator_switch
 
 
 def collect_sorted_captured_token_sizes(capture_descs: dict) -> list[int]:
@@ -108,6 +109,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
         self.update_stream = self.model_runner.update_stream
+        self._zero_window_replay: tuple[BatchExecutionDescriptor, Any, ZeroWindowPlan] | None = None
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
@@ -125,6 +127,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         attn_metadata = self.model_runner.model_state.attn_metadata
 
         metadata = getattr(self.model_runner.model_state, "device_metadata", None)
+        plan = None
         try:
             prepare_engram = getattr(self.model_runner.model_state, "prepare_engram", None)
             if prepare_engram is not None:
@@ -142,14 +145,30 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     ),
                 ):
                     prepare_engram()
+            ids = getattr(self.model_runner, "_draft_prepare_ids", None)
+            if ids and self._zero_window_replay is not None:
+                captured_desc, graph, captured_plan = self._zero_window_replay
+                if desc == captured_desc and self.graphs[desc] is graph and captured_plan.is_complete():
+                    plan = captured_plan
+                    plan.block_id.fill_(ids[0])
             if use_updatable_graph(attn_backend):
-                return self._updatable_graph_replay(desc, attn_metadata)
+                result = self._updatable_graph_replay(desc, attn_metadata)
             else:
                 # This will be removed once the refactoring is fully complete.
-                return self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+                result = self._graph_relay(attn_backend, desc, num_tokens, attn_metadata)
+            if plan is not None:
+                # The graph joins the side stream before the worker can publish
+                # the reserved page. Extra IDs use the ordinary zeroer.
+                self.model_runner._draft_prepare_ids = ids[1:]
+            return result
         finally:
-            if metadata is not None:
-                metadata.finish_replay()
+            try:
+                if plan is not None:
+                    # Reset runs after the replay and its side-stream join.
+                    plan.block_id.fill_(NO_BLOCK_ID)
+            finally:
+                if metadata is not None:
+                    metadata.finish_replay()
 
     def _graph_relay(self, attn_backend, desc, num_tokens, attn_metadata):
         self.update_stream.wait_stream(torch.npu.current_stream())
@@ -214,10 +233,11 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        model = ModelWithContext(model, device_metadata=metadata)
+        zero_desc, zero_plan = self._plan_zero_windows()
+        model = ModelWithContext(model, device_metadata=metadata, zero_window=zero_plan)
         try:
             with communicator_switch():
-                return super().capture(
+                super().capture(
                     model,
                     model_state,
                     input_buffers,
@@ -231,10 +251,39 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     lora_capture_hook=lora_capture_hook,
                     progress_bar_desc=progress_bar_desc,
                 )
+            if zero_desc is not None and zero_plan is not None and zero_desc in self.graphs:
+                # Partial captures also hold references to the sentinel and events.
+                self._zero_window_replay = (zero_desc, self.graphs[zero_desc], zero_plan)
+                if zero_plan.is_complete():
+                    logger.info("DSpark zero windows captured: %d/%d", zero_plan.recorded, zero_plan.seen)
+                else:
+                    logger.warning("DSpark zero windows inactive: captured %d projections", zero_plan.seen)
         finally:
             # Input preparation can fail before ModelWithContext.forward runs.
             if metadata is not None:
                 metadata.finish()
+
+
+    def _plan_zero_windows(self) -> tuple[BatchExecutionDescriptor | None, ZeroWindowPlan | None]:
+        self._zero_window_replay = None
+        if self.model_runner.ascend_config.dspark_prepare_next_page is not True:
+            return None, None
+
+        zeroer = getattr(self.model_runner, "kv_block_zeroer", None)
+        candidates = [desc for descs in self._capture_descs.values() for desc in descs if desc.num_tokens == TOKENS]
+        # Capture only when the wrapper can identify this graph by token count.
+        if len(candidates) == 1 and isinstance(zeroer, AscendV2KVBlockZeroer):
+            desc = candidates[0]
+            if (
+                desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs == NUM_REQUESTS
+                and desc.uniform_token_count == TOKENS_PER_REQUEST
+                and desc.num_ubatches == 1
+                and not desc.num_active_loras
+            ):
+                return desc, ZeroWindowPlan([item._meta for item in zeroer._zeroers], self.device)
+        logger.warning("DSpark zero windows inactive: no unique supported FULL descriptor or zeroer")
+        return None, None
 
 
 class ModelWithContext(nn.Module):
@@ -242,12 +291,15 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
+    def __init__(
+        self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None, zero_window=None
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
+        self.zero_window = zero_window
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -265,6 +317,11 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
+            if self.zero_window is not None and _EXTRA_CTX.capturing:
+                input_ids = kwargs.get("input_ids")
+                if input_ids is not None and input_ids.shape[0] == TOKENS:
+                    with self.zero_window.capture():
+                        return self.original_model(*args, **kwargs)
             return self.original_model(*args, **kwargs)
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
